@@ -1,0 +1,124 @@
+name: Sync from Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to sync'
+        required: false
+        default: 'dev'
+  repository_dispatch:
+    types: [sync]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FORK_PAT }}
+
+      - name: Sync from upstream
+        id: sync
+        env:
+          TRIGGER_BRANCH: ${{ github.event.client_payload.branch || github.event.inputs.branch || 'dev' }}
+          TRIGGER_COMMIT: ${{ github.event.client_payload.commit || '' }}
+          TRIGGER_MESSAGE: ${{ github.event.client_payload.message || '' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/goorm-gongbang/101-goormgb-frontend.git
+          git fetch upstream
+
+          BRANCH="$TRIGGER_BRANCH"
+          echo "Syncing branch: $BRANCH"
+
+          git checkout $BRANCH 2>/dev/null || git checkout -b $BRANCH
+
+          # 현재 workflow 파일 백업
+          cp .github/workflows/sync-upstream.yml /tmp/sync-upstream.yml 2>/dev/null || true
+
+          # upstream 최신 커밋 정보
+          COMMIT_HASH=$(git rev-parse --short upstream/$BRANCH)
+          COMMIT_MSG=$(git log -1 --format="%s" upstream/$BRANCH | head -c 50)
+
+          # upstream으로 reset
+          git reset --hard upstream/$BRANCH
+
+          # workflow 파일 복구
+          mkdir -p .github/workflows
+          cp /tmp/sync-upstream.yml .github/workflows/sync-upstream.yml 2>/dev/null || true
+
+          # upstream의 sync-to-fork.yml 제거
+          rm -f .github/workflows/sync-to-fork.yml
+          git add .github/workflows/
+          git commit -m "chore: sync from upstream" --allow-empty || true
+          git push https://${{ secrets.FORK_PAT }}@github.com/techupgrgbcn-crypto/goormgb-frontend.git $BRANCH --force
+
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "commit_msg=$COMMIT_MSG" >> $GITHUB_OUTPUT
+
+      - name: Notify Discord Success
+        if: success()
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          BRANCH: ${{ steps.sync.outputs.branch }}
+          COMMIT_HASH: ${{ steps.sync.outputs.commit_hash }}
+          COMMIT_MSG: ${{ steps.sync.outputs.commit_msg }}
+        run: |
+          COMMIT_URL="https://github.com/goorm-gongbang/101-goormgb-frontend/commit/${COMMIT_HASH}"
+
+          # 브랜치별 설정
+          if [ "$BRANCH" = "dev" ]; then
+            EMOJI="🔧"
+            ENV_NAME="Dev"
+            COLOR=3447003
+            SITE_URL="dev.goormgb.space"
+          elif [ "$BRANCH" = "staging" ]; then
+            EMOJI="🧪"
+            ENV_NAME="Staging"
+            COLOR=16776960
+            SITE_URL="staging.playball.one"
+          else
+            EMOJI="🚀"
+            ENV_NAME="Production"
+            COLOR=15105570
+            SITE_URL="playball.one"
+          fi
+
+          curl -X POST "$WEBHOOK" -H "Content-Type: application/json" -d '{
+            "embeds": [{
+              "title": "'"$EMOJI"' '"$ENV_NAME"' 배포",
+              "color": '"$COLOR"',
+              "fields": [
+                {"name": "Branch", "value": "'"$BRANCH"'", "inline": true},
+                {"name": "Commit", "value": "[`'"$COMMIT_HASH"'`]('"$COMMIT_URL"')", "inline": true},
+                {"name": "Message", "value": "'"$COMMIT_MSG"'", "inline": false},
+                {"name": "Site", "value": "['"$SITE_URL"'](https://'"$SITE_URL"')", "inline": false}
+              ],
+              "footer": {"text": "PlayBall Frontend"},
+              "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+            }]
+          }'
+
+      - name: Notify Discord Failure
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          BRANCH: ${{ github.event.client_payload.branch || 'dev' }}
+        run: |
+          curl -X POST "$WEBHOOK" -H "Content-Type: application/json" -d '{
+            "embeds": [{
+              "title": "❌ Frontend Sync 실패",
+              "description": "[GitHub Actions 로그 확인](https://github.com/techupgrgbcn-crypto/goormgb-frontend/actions)",
+              "color": 15158332,
+              "fields": [
+                {"name": "📦 브랜치", "value": "'"$BRANCH"'", "inline": true}
+              ],
+              "footer": {"text": "goormgb-frontend"},
+              "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+            }]
+          }'
